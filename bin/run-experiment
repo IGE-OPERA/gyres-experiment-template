@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# Experiment runner bridge for ocean-gyres ledgers created from
+# gyres-experiment-template. Mirrors the my-legoESM-ocean-experiments
+# workflow, adapted to ocean-gyres' single-repo reality: there is no
+# runners repo — the `gyres` CLI (from the ocean-gyres checkout) is the
+# runner, and `run_manifest.json` is the provenance record.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+MACHINES_DIR="${REPO_DIR}/machines"
+GYRES_DIR="${GYRES_DIR:-${REPO_DIR}/../ocean-gyres}"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command> <run-dir>
+
+Commands:
+  init       Read run.yaml, write config.yaml + run.sh into the run directory
+  run        Execute the experiment (direct, sbatch, or oarsub) and update status
+  record     Re-generate run_manifest.json + config.yaml from config.yaml (no run)
+  reproduce  Re-run the experiment from its run_manifest.json via gyres reproduce
+
+Arguments:
+  <run-dir>  Path to the experiment directory
+             (e.g. runs/macbook_2026-10-15_hh00-smoke)
+
+Environment:
+  GYRES_DIR     Path to the ocean-gyres checkout (default: ../ocean-gyres)
+  GYRES_PYTHON  Explicit python interpreter with gyres importable
+  GYRES_BIN     Full gyres command prefix (e.g. "uv run --project ~/git/ocean-gyres python -m gyres.cli");
+                overrides all detection in generated run.sh and this tool
+
+run.yaml schema:
+  preset: <name>          # preset factory from gyres.configs.presets (or 'config:')
+  config: <path>          # alternative to preset: an existing experiment YAML
+  machine: <name.yaml>    # optional; auto-detected from hostname when omitted
+  resolution: <deg>       # optional grid-resolution override (presets only)
+  overrides: {}           # optional Experiment-field overrides (dt, n_steps, tau0, ...)
+  status: planned         # planned | submitted | running | completed | failed
+  notes: ""               # optional free text
+
+Naming convention:
+  <nickname>_<YYYY-MM-DD>_<description>
+  e.g. macbook_2026-10-15_hh00-smoke
+EOF
+    exit 1
+}
+
+need_run_yaml() {
+    [ -f "$1/run.yaml" ] || { echo "ERROR: $1/run.yaml not found" >&2; exit 1; }
+}
+
+need_config_yaml() {
+    [ -f "$1/config.yaml" ] || {
+        echo "ERROR: $1/config.yaml not found. Run '$(basename "$0") init' first." >&2
+        exit 1
+    }
+}
+
+parse_run_yaml() {
+    local run_dir="$1" field="$2"
+    "$PYTHON" - "$run_dir/run.yaml" "$field" <<'PYEOF'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    d = yaml.safe_load(f) or {}
+print(d.get(sys.argv[2], "") or "", end="")
+PYEOF
+}
+
+update_status() {
+    local run_dir="$1" new_status="$2"
+    "$PYTHON" - "$run_dir/run.yaml" "$new_status" <<'PYEOF'
+import sys, yaml
+path = sys.argv[1]
+with open(path) as f:
+    d = yaml.safe_load(f) or {}
+d["status"] = sys.argv[2]
+with open(path, "w") as f:
+    yaml.dump(d, f, default_flow_style=False, sort_keys=False)
+PYEOF
+}
+
+# Resolve the current machine by matching `hostname -s` against the
+# `hostnames` lists in machines/*.yaml (skipping _template).
+resolve_machine() {
+    local hostname
+    hostname=$(hostname -s)
+    local yaml_file base
+    for yaml_file in "${MACHINES_DIR}"/*.yaml; do
+        [ -f "$yaml_file" ] || continue
+        base=$(basename "$yaml_file" .yaml)
+        [ "$base" = "_template" ] && continue
+        if "$PYTHON" - "$yaml_file" "$hostname" <<'PYEOF' 2>/dev/null
+import sys, yaml
+with open(sys.argv[1]) as f:
+    d = yaml.safe_load(f) or {}
+sys.exit(0 if sys.argv[2] in d.get("hostnames", []) else 1)
+PYEOF
+        then
+            echo "$base"
+            return
+        fi
+    done
+}
+
+get_machine_field() {
+    local machine="$1" key="$2" default="${3:-}"
+    local yaml_file="${MACHINES_DIR}/${machine}.yaml"
+    if [ -f "$yaml_file" ]; then
+        "$PYTHON" - "$yaml_file" "$key" "$default" <<'PYEOF' 2>/dev/null
+import sys, yaml
+
+with open(sys.argv[1]) as f:
+    d = yaml.safe_load(f) or {}
+v = d.get(sys.argv[2], sys.argv[3])
+if v is None:
+    print("", end="")
+elif isinstance(v, list):
+    print("\n".join(str(i) for i in v), end="")
+elif isinstance(v, bool):
+    print("true" if v else "false", end="")
+else:
+    print(v, end="")
+PYEOF
+    else
+        echo "$default"
+    fi
+}
+
+get_nickname() {
+    local machine="$1"
+    local nickname
+    nickname=$(get_machine_field "$machine" nickname "")
+    if [ -n "$nickname" ]; then
+        echo "$nickname"
+    else
+        echo "$machine" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g'
+    fi
+}
+
+# Resolve a gyres command prefix. Precedence:
+#   $GYRES_BIN > machine gyres_python > $GYRES_DIR/.venv > uv run --project > python3
+# Prints a command prefix; caller appends `run|reproduce|...`.
+resolve_gyres_cmd() {
+    local machine_gyres_python="${1:-}"
+    if [ -n "${GYRES_BIN:-}" ]; then
+        echo "$GYRES_BIN"
+        return
+    fi
+    if [ -n "$machine_gyres_python" ]; then
+        echo "$machine_gyres_python -m gyres.cli"
+        return
+    fi
+    local venv_python="${GYRES_DIR}/.venv/bin/python"
+    if [ -x "$venv_python" ] && "$venv_python" -c "import gyres" 2>/dev/null; then
+        echo "$venv_python -m gyres.cli"
+        return
+    fi
+    if command -v uv >/dev/null 2>&1 && [ -d "$GYRES_DIR" ] \
+        && uv run --project "$GYRES_DIR" python -c "import gyres" 2>/dev/null; then
+        echo "uv run --project ${GYRES_DIR} python -m gyres.cli"
+        return
+    fi
+    if python3 -c "import gyres" 2>/dev/null; then
+        echo "python3 -m gyres.cli"
+        return
+    fi
+    echo "ERROR: no python with gyres importable found" >&2
+    echo "       Set GYRES_DIR, GYRES_PYTHON, or GYRES_BIN (see usage)." >&2
+    exit 1
+}
+
+# Emit the scheduler directive block for run.sh from a machine config.
+scheduler_headers() {
+    local machine="$1" name="$2"
+    local scheduler
+    scheduler=$(get_machine_field "$machine" scheduler "null")
+    case "$scheduler" in
+        slurm)
+            local mem gres qos out err
+            mem=$(get_machine_field "$machine" scheduler_mem "")
+            gres=$(get_machine_field "$machine" scheduler_gres "")
+            qos=$(get_machine_field "$machine" scheduler_qos "")
+            out=$(get_machine_field "$machine" scheduler_output "slurm-%j.out")
+            err=$(get_machine_field "$machine" scheduler_error "")
+            echo "#SBATCH --job-name=${name}"
+            echo "#SBATCH --partition=$(get_machine_field "$machine" scheduler_partition "")"
+            echo "#SBATCH --account=$(get_machine_field "$machine" scheduler_account "")"
+            echo "#SBATCH --time=$(get_machine_field "$machine" scheduler_walltime "01:00:00")"
+            echo "#SBATCH --nodes=$(get_machine_field "$machine" scheduler_nodes 1)"
+            echo "#SBATCH --ntasks-per-node=$(get_machine_field "$machine" scheduler_tasks_per_node 1)"
+            [ -n "$mem" ] && echo "#SBATCH --mem=${mem}"
+            [ -n "$gres" ] && echo "#SBATCH --gres=${gres}"
+            [ -n "$qos" ] && echo "#SBATCH --qos=${qos}"
+            echo "#SBATCH --output=${out}"
+            [ -n "$err" ] && echo "#SBATCH --error=${err}"
+            ;;
+        oar)
+            echo "#OAR -n ${name}"
+            echo "#OAR --project $(get_machine_field "$machine" oar_project "")"
+            echo "#OAR -l $(get_machine_field "$machine" oar_resources "/nodes=1")/walltime=$(get_machine_field "$machine" scheduler_walltime "01:00:00")"
+            local props types t
+            props=$(get_machine_field "$machine" oar_properties "")
+            [ -n "$props" ] && echo "#OAR -p ${props}"
+            types=$(get_machine_field "$machine" oar_types "")
+            for t in $types; do
+                [ -n "$t" ] && echo "#OAR -t ${t}"
+            done
+            ;;
+        *) : ;;  # direct execution — no headers
+    esac
+}
+
+# Build config.yaml from run.yaml (preset/config + resolution + overrides).
+build_config() {
+    local run_dir="$1" name="$2"
+    (
+        cd "$run_dir"
+        "$PYTHON" - "$name" <<'PYEOF'
+import dataclasses
+import sys
+
+import yaml
+
+from gyres.configs.experiment import Experiment
+
+run_dir_name = sys.argv[1]
+with open("run.yaml") as f:
+    run = yaml.safe_load(f) or {}
+
+preset = (run.get("preset") or "").strip()
+config_path = (run.get("config") or "").strip()
+overrides = dict(run.get("overrides") or {})
+
+if preset and config_path:
+    sys.exit("ERROR: 'preset' and 'config' in run.yaml are mutually exclusive")
+if not preset and not config_path:
+    sys.exit("ERROR: run.yaml needs either 'preset' or 'config'")
+
+if preset:
+    # The CLI preset registry is the single source of truth (issue #66).
+    from gyres.cli import _PRESETS
+
+    factory = _PRESETS.get(preset)
+    if factory is None:
+        sys.exit(
+            f"ERROR: unknown preset {preset!r}; available: {sorted(_PRESETS)}"
+        )
+    exp = factory()
+    resolution = run.get("resolution")
+    if resolution:
+        exp = exp.with_resolution(float(resolution))
+else:
+    exp = Experiment.from_yaml(config_path)
+
+valid = {f.name for f in dataclasses.fields(Experiment)}
+unknown = set(overrides) - valid
+if unknown:
+    sys.exit(
+        f"ERROR: unknown override(s) {sorted(unknown)}; "
+        f"valid Experiment fields: {sorted(valid)}"
+    )
+exp = dataclasses.replace(exp, **overrides)
+exp = dataclasses.replace(exp, name=run_dir_name, io_dir=".")
+exp.to_yaml("config.yaml")
+print("Wrote config.yaml")
+PYEOF
+    )
+}
+
+# Generate run.sh: shebang + env_setup + gyres invocation.
+build_run_sh() {
+    local run_dir="$1" name="$2" machine="$3" gyres_cmd_prefix="$4"
+    local scheduler
+    scheduler=$(get_machine_field "$machine" scheduler "null")
+    {
+        echo "#!/usr/bin/env bash"
+        echo "# Generated by bin/run-experiment init for ${name}."
+        echo "# Machine: ${machine:-<none>} (scheduler: ${scheduler})"
+        echo "# Regenerate with: bin/run-experiment init $(basename "$run_dir")"
+        echo "set -euo pipefail"
+        echo 'cd "$(dirname "$0")"'
+        if [ -n "$machine" ]; then
+            local env_cmds
+            env_cmds=$(get_machine_field "$machine" env_setup "")
+            if [ -n "$env_cmds" ]; then
+                echo ""
+                echo "# --- environment (machines/${machine}.yaml) ---"
+                while IFS= read -r line; do
+                    [ -n "$line" ] && echo "$line"
+                done <<< "$env_cmds"
+            fi
+        fi
+        echo ""
+        echo 'if [ -n "${GYRES_BIN:-}" ]; then'
+        echo '    GYRES_RUN="${GYRES_BIN}"'
+        echo "else"
+        echo "    GYRES_RUN=\"${gyres_cmd_prefix}\""
+        echo "fi"
+        echo '${GYRES_RUN} run --config config.yaml'
+    } > "$run_dir/run.sh"
+    chmod +x "$run_dir/run.sh"
+}
+
+cmd_init() {
+    local run_dir
+    run_dir="$(cd "$1" && pwd)"
+    need_run_yaml "$run_dir"
+
+    local name machine
+    name=$(basename "$run_dir")
+    machine=$(parse_run_yaml "$run_dir" machine)
+
+    if [ -z "$machine" ]; then
+        machine=$(resolve_machine || true)
+        if [ -n "$machine" ]; then
+            echo "Auto-detected machine: $machine"
+        else
+            echo "WARNING: no machines/*.yaml matches $(hostname -s);" >&2
+            echo "         run.sh will assume direct execution (no scheduler)." >&2
+            echo "         Fix with: bin/detect-machine --write" >&2
+        fi
+    fi
+
+    local machine_gyres_python=""
+    if [ -n "$machine" ]; then
+        machine_gyres_python=$(get_machine_field "$machine" gyres_python "")
+    fi
+    # Respect GYRES_PYTHON/GYRES_BIN for the record/reproduce commands too.
+    if [ -n "${GYRES_PYTHON:-}" ]; then
+        machine_gyres_python="$GYRES_PYTHON"
+    fi
+
+    if [ -f "$run_dir/config.yaml" ]; then
+        echo "WARNING: overwriting existing $run_dir/config.yaml" >&2
+    fi
+
+    echo "Initialising experiment: $name"
+    echo "  Machine: $machine"
+    echo "  Gyres:   $GYRES_DIR"
+
+    build_config "$run_dir" "$name"
+
+    local gyres_cmd
+    gyres_cmd=$(resolve_gyres_cmd "$machine_gyres_python")
+    build_run_sh "$run_dir" "$name" "$machine" "$gyres_cmd"
+
+    echo "Done. Files in $run_dir:"
+    ls -1 "$run_dir"
+}
+
+cmd_run() {
+    local run_dir
+    run_dir="$(cd "$1" && pwd)"
+    need_config_yaml "$run_dir"
+
+    local name machine scheduler
+    name=$(basename "$run_dir")
+    machine=$(parse_run_yaml "$run_dir" machine)
+    if [ -z "$machine" ]; then
+        machine=$(resolve_machine || true)
+    fi
+    scheduler=$(get_machine_field "${machine:-_none}" scheduler "null")
+
+    case "$scheduler" in
+        slurm)
+            echo "Submitting via SLURM: $name"
+            local job_id
+            job_id=$(cd "$run_dir" && sbatch run.sh | grep -oE '[0-9]+')
+            echo "Submitted SLURM job: $job_id"
+            echo "  Monitor: squeue -j $job_id   Cancel: scancel $job_id"
+            update_status "$run_dir" "submitted"
+            ;;
+        oar)
+            echo "Submitting via OAR: $name"
+            (cd "$run_dir" && oarsub -S ./run.sh)
+            update_status "$run_dir" "submitted"
+            ;;
+        *)
+            echo "Running directly: $name"
+            if (cd "$run_dir" && bash run.sh); then
+                update_status "$run_dir" "completed"
+            else
+                update_status "$run_dir" "failed"
+                echo "ERROR: run.sh failed — status set to 'failed'" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+cmd_record() {
+    local run_dir
+    run_dir="$(cd "$1" && pwd)"
+    need_config_yaml "$run_dir"
+    (
+        cd "$run_dir"
+        "$PYTHON" - <<'PYEOF'
+from gyres.configs.experiment import Experiment
+from gyres.io.manifest import write_run_manifest
+
+exp = Experiment.from_yaml("config.yaml")
+_, path = write_run_manifest(".", exp, argv=["record"])
+print(f"Wrote {path}")
+PYEOF
+    )
+}
+
+cmd_reproduce() {
+    local run_dir
+    run_dir="$(cd "$1" && pwd)"
+    need_config_yaml "$run_dir"
+    [ -f "$run_dir/run_manifest.json" ] || {
+        echo "ERROR: $run_dir/run_manifest.json not found." >&2
+        echo "       Run the experiment first (bin/run-experiment run)." >&2
+        exit 1
+    }
+
+    local machine machine_gyres_python=""
+    machine=$(parse_run_yaml "$run_dir" machine)
+    if [ -z "$machine" ]; then
+        machine=$(resolve_machine || true)
+    fi
+    if [ -n "$machine" ]; then
+        machine_gyres_python=$(get_machine_field "$machine" gyres_python "")
+    fi
+    [ -n "${GYRES_PYTHON:-}" ] && machine_gyres_python="$GYRES_PYTHON"
+
+    local gyres_cmd stamp
+    gyres_cmd=$(resolve_gyres_cmd "$machine_gyres_python")
+    stamp=$(date -u +%Y%m%d-%H%M%S)
+
+    echo "Reproducing: $(basename "$run_dir")"
+    (cd "$run_dir" && ${gyres_cmd} reproduce . --output-dir "reproductions/${stamp}")
+}
+
+PYTHON="${GYRES_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    # Pick any interpreter that can read YAML + gyres (for parsing/config building).
+    for candidate in "${GYRES_DIR}/.venv/bin/python" python3; do
+        if "$candidate" -c "import yaml" 2>/dev/null; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+    PYTHON="${PYTHON:-python3}"
+fi
+
+if [ $# -lt 2 ]; then
+    usage
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    init)       cmd_init "$1" ;;
+    run)        cmd_run "$1" ;;
+    record)     cmd_record "$1" ;;
+    reproduce)  cmd_reproduce "$1" ;;
+    *)          echo "ERROR: unknown command: $command" >&2; usage ;;
+esac

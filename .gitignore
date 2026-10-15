@@ -1,0 +1,39 @@
+# ---------- Experiment output data (never commit) ----------
+*.nc
+*.nc4
+*.zarr/
+*.grib
+*.grb
+*.h5
+*.hdf5
+*.npz
+output/
+results/
+data/
+reproductions/
+diagnostics.json
+
+# ---------- Scheduler logs (never commit) ----------
+OAR.*.stdout
+OAR.*.stderr
+slurm-*.out
+slurm-*.err
+
+# ---------- Python ----------
+__pycache__/
+*.py[codz]
+*$py.class
+.ipynb_checkpoints/
+.venv
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---------- Editors / OS ----------
+.DS_Store
+.vscode/
+.idea/

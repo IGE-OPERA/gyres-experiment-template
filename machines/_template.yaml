@@ -1,0 +1,65 @@
+# Machine configuration template.
+# Copy this file and rename it (e.g. Juliens-MacBook-Pro.yaml, jean-zay.yaml).
+# Machine configs ARE tracked here since this is a personal ledger repo.
+# Absolute paths are acceptable.
+#
+# Generate a first guess automatically:
+#   bin/detect-machine --write
+
+# ---------- Identity ----------
+nickname: ""               # Short name for directory naming (e.g. macbook, jeanzay, perlmutter)
+hostnames: []              # List of `hostname -s` outputs for auto-detection (e.g. [Juliens-MacBook-Pro])
+
+# ---------- Remote access (optional) ----------
+ssh_alias: ""              # ~/.ssh/config alias to reach this machine; empty = local machine
+workspace: ""              # Optional: absolute path of the workspace holding the ocean-gyres
+                           # checkout and this ledger on that machine; fallback: dirname(gyres_dir)
+
+# ---------- Scheduler ----------
+scheduler: null            # null | slurm | oar
+scheduler_partition: ""
+scheduler_account: ""
+scheduler_walltime: "01:00:00"   # SLURM --time / appended to the OAR -l line
+scheduler_nodes: 1
+scheduler_tasks_per_node: 1
+scheduler_mem: ""          # Memory per job (e.g. "64000" for 64 GB); empty = scheduler default
+scheduler_gres: ""         # Generic resources (e.g. "gpu:1"); empty = none
+scheduler_qos: ""          # QOS (e.g. "longjobs"); empty = default
+scheduler_output: ""       # Stdout pattern (e.g. "slurm-%j.out"); empty = scheduler default
+scheduler_error: ""        # Stderr pattern (e.g. "slurm-%j.err"); empty = merged with output
+
+# ---------- OAR (GRICAD/CIMENT: bigfoot, dahu, kraken) ----------
+# Used when scheduler: oar. run.sh carries #OAR directives; submit with:
+#   cd <run-dir> && oarsub -S ./run.sh
+# (path form required — a bare `run.sh` fails PATH lookup)
+# Job logs land as OAR.<name>.<jobid>.stdout/.stderr in the run directory;
+# monitor with oarstat -u.
+oar_project: ""            # Mandatory allocation name (e.g. "pr-data-ocean") → --project
+oar_resources: "/nodes=1"  # Resource tree (e.g. "/nodes=1/gpu=1"); walltime appended from scheduler_walltime
+oar_properties: ""         # SQL WHERE clause on node properties (e.g. "gpumodel = 'V100'").
+                           # NOTE: single quotes inside are fine, but do NOT wrap the whole
+                           # clause in double quotes — the #OAR -p directive parser passes
+                           # the value verbatim and quoted input aborts the submission
+oar_types: []              # OAR job types (e.g. ["devel"], ["besteffort"])
+
+# ---------- Devices ----------
+devices: "auto"            # auto | cpu | gpu | tpu
+n_devices: "auto"          # auto or integer
+precision: "fp64"          # fp64 (ocean-gyres default) | fp32
+
+# ---------- Paths ----------
+gyres_dir: ""              # Absolute path to the ocean-gyres checkout (default: ../ocean-gyres
+                           # relative to this ledger; override here or via $GYRES_DIR)
+gyres_python: ""           # Explicit python interpreter with gyres importable (optional;
+                           # overrides venv/uv detection, e.g. a venv on an HPC login node)
+data_root: ""              # Optional: pooch cache location for ETOPO2v2 / HR83 downloads
+output_root: "./output"    # Root for experiment output (runs write into their own directory)
+
+# ---------- Environment ----------
+# Shell commands embedded at the top of every generated run.sh
+# (executed for both direct and scheduler runs).
+# Example:
+# env_setup:
+#   - "module load python/3.12"
+#   - "source /path/to/venv/bin/activate"
+env_setup: []
